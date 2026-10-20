@@ -34,59 +34,79 @@ plant sample is small.
 
 ## 2. Pipeline and data model
 
-**Layers.** Raw hourly files per site (bronze, parquet, never edited) -> computed
-yields per site (silver, CSV, rebuilt from bronze) -> PostgreSQL star schema ->
-Power BI. Raw data is kept so the model can be recomputed when an assumption changes,
-without downloading again.
+**How the data flows.**
+Raw hourly weather files, one per site (bronze) → yearly yield per site computed in Python (silver) → PostgreSQL → Power BI.
+The raw files are kept, so if I change an assumption I can recompute the yields without downloading again.
 
-**PostgreSQL star schema**
+**PostgreSQL tables**
 
-| Table | Rows | Role | Main columns |
-|---|---|---|---|
-| `dim_site` | 247 | Dimension | `site_id`, `lat`, `lon`, `label` (e.g. "27 km SW of Ifrane"), `nearest_place`, `dist_km`, `direction`, `region` (12), `substation_km`, `hv_substation_km` |
-| `fact_hourly` | 2,163,720 | Fact | `site_id`, `ts` (UTC), `shortwave_radiation`, `direct_normal_irradiance`, `temperature_2m`, `wind_speed_100m` |
-| `dim_substation` | 622 | Dimension | location, `voltage_kv` |
-| `dim_solar_plant` | 10 (1 MW or more) | Dimension | `name`, `capacity_mw`, `lat`, `lon` |
-
-`fact_hourly.site_id` joins to `dim_site.site_id`.
-
-**Power BI model**
-
-| Table | Source | Relationship |
+| Table | Rows | Content |
 |---|---|---|
-| Sites | `dim_site` | one-to-many to Hourly Weather on `site_id`; one-to-one to Site Yield |
-| Hourly Weather | `fact_hourly` | many side |
-| Site Yield | `site_features.csv` (Python yield per site) | one-to-one with Sites |
-| Solar Plants | `solar_plants.csv`, filtered to 1 MW or more | none |
-| Plant Ranks | `plant_ranks.csv` (Python ranks) | none |
-| Map Points | calculated table: top 10 by yield + real plants | none |
+| `dim_site` | 247 | One row per site: `site_id`, `lat`, `lon`, `label` (e.g. "27 km SW of Ifrane"), `region`, `substation_km`, `hv_substation_km` |
+| `fact_hourly` | 2,163,720 | One row per site and hour: `site_id`, `ts`, `shortwave_radiation`, `temperature_2m`, `wind_speed_100m` |
+| `dim_substation` | 622 | Substations from OpenStreetMap, with `voltage_kv` |
+| `dim_solar_plant` | 10 | Real plants of 1 MW or more: `name`, `capacity_mw`, `lat`, `lon` |
+
+`dim_site` is the descriptive table and `fact_hourly` is the big measurement table. They are linked by `site_id`.
+
+**Power BI tables**
+
+| Table | Comes from | Linked to |
+|---|---|---|
+| Sites | `dim_site` | Hourly Weather (one-to-many on `site_id`) and Site Yield (one-to-one) |
+| Hourly Weather | `fact_hourly` | Sites |
+| Site Yield | `site_features.csv` (yield per site from Python) | Sites |
+| Plant Ranks | `plant_ranks.csv` (ranks from Python) | none |
+| Solar Plants | `solar_plants.csv`, 1 MW or more | none |
+| Map Points | calculated table: top 10 sites by yield + real plants | none |
 
 ## 3. Method
 
-**Yield (per hour, per site, then summed over the year)**
-```
-wind10  = wind100 x 0.708
-Tcell   = T + G / (25 + 6.84 x wind10)
-kWh/kWp = G / 1000 x 0.86 x (1 - 0.004 x (Tcell - 25))
-```
-`G` is radiation in W/m2. Panels are assumed fixed and horizontal. 0.86 is a typical
-performance ratio (an assumption, applied to all sites equally), and 0.4% per degree
-is the usual silicon temperature loss.
+### Weather data and why each variable matters
 
-**Score**
-```
-Score = 100 x ( w x YieldNorm + (1 - w) x (1 - GridNorm) )
-```
-Both inputs are min-max scaled to 0 to 1 over all 247 sites. Default `w` = 0.6.
-Grid distance = nearest HV substation (60 kV or more), falling back to the nearest
-substation of any voltage. It is a proxy: it ignores line capacity.
+For every site and every hour of 2023, ERA5 gives three values. ERA5 is a weather model corrected with real observations, so it covers places with no weather stations.
 
-**DAX measures.** `Yield Norm` and `Grid Norm` use `ALL()` for the min and max, so
-filtering by region does not rescale the scores. `Site Score` combines them with the
-weight slider.
+| Variable | What it is | Why it matters |
+|---|---|---|
+| `shortwave_radiation` | Sunlight reaching a flat surface (W/m²) | The main driver: more sunlight means more electricity |
+| `temperature_2m` | Air temperature (°C) | Hot panels are less efficient: about 0.4% lost per °C above 25 °C |
+| `wind_speed_100m` | Wind speed at 100 m height | Wind cools the panels, which gives a small gain in output |
 
-**Cross-check.** Yield and score were built in both Python and DAX. The best yield
-matches (1,878.04 vs 1,878.05 kWh/kWp) and the top 10 by score matches at w = 0.6.
+Sunlight decides how much energy arrives. Temperature and wind decide how much of it the panel can turn into electricity.
+
+### PV yield (kWh produced per kWp installed)
+
+Computed for every hour, then summed over the year:
+
+```
+wind10  = wind100 × 0.708                    (wind scaled from 100 m to 10 m)
+Tcell   = T + G / (25 + 6.84 × wind10)       (panel temperature)
+kWh/kWp = G / 1000 × 0.86 × (1 − 0.004 × (Tcell − 25))
+```
+
+- `G` = `shortwave_radiation`, `T` = `temperature_2m`.
+- The panel is hotter than the air when sunlight is strong, and cooler when wind is strong.
+- `0.86` is a typical performance ratio (losses in cables, inverter and dust). It is an assumption and is the same for all sites.
+- Panels are assumed fixed and flat.
+
+Result: 1,499 to 1,878 kWh/kWp per year across the 247 sites.
+
+### Score
+
+```
+Score = 100 × ( w × YieldNorm + (1 − w) × (1 − GridNorm) )
+```
+
+- `YieldNorm` and `GridNorm` rescale yield and grid distance to a 0 to 1 range across all 247 sites, so they can be added.
+- `GridNorm` is flipped (`1 − GridNorm`), so a closer substation gives a higher score.
+- `w` is the weight on yield. Default 0.6.
+- Grid distance is the distance to the nearest substation of 60 kV or more, or to any substation if none is tagged. It is a simple proxy and ignores line capacity.
+
+In Power BI, the weight is a slider, and `ALL()` keeps the rescaling based on all 247 sites even when a region is selected.
+
+### Check
+
+Yield and score were computed in both Python and Power BI. The best yield matches (1,878.04 vs 1,878.05 kWh/kWp), and the top 10 by score matches at w = 0.6.
 
 ## 4. Power BI analysis: the four hypotheses
 
